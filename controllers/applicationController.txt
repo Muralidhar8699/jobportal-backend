@@ -1,0 +1,777 @@
+import { ObjectId } from "mongodb";
+import { getDb } from "../config/db.js";
+import { cloudinary } from "../config/cloudinary.js";
+
+// @desc Apply for a job
+// @route POST /applications/apply/:jobId
+// @access Private/Applicant
+export const applyForJob = async (req, res) => {
+  try {
+    console.log("=== APPLY FOR JOB REQUEST ===");
+    console.log("Job ID:", req.params.jobId);
+    console.log("Experience:", req.body.experience);
+    console.log("User ID:", req.user?._id);
+    console.log("File uploaded:", req.file ? "YES" : "NO");
+
+    const { jobId } = req.params;
+    const { experience } = req.body;
+    const applicantId = req.user._id;
+
+    // Basic validations
+    if (!ObjectId.isValid(jobId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid job ID",
+      });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        message: "Please upload a resume (PDF or DOCX)",
+      });
+    }
+
+    if (!experience) {
+      return res.status(400).json({
+        success: false,
+        message: "Experience is required",
+      });
+    }
+
+    const db = getDb();
+    const jobsCollection = db.collection("jobs");
+    const applicationsCollection = db.collection("applications");
+
+    console.log("✅ Fetching job from database...");
+    const job = await jobsCollection.findOne({
+      _id: new ObjectId(jobId),
+      status: "published",
+    });
+
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        message: "Job not found or not available for applications",
+      });
+    }
+
+    console.log("✅ Job found:", job.title);
+    console.log("✅ Checking for existing application...");
+
+    const existingApplication = await applicationsCollection.findOne({
+      jobId: new ObjectId(jobId),
+      applicantId: new ObjectId(applicantId),
+    });
+
+    if (existingApplication) {
+      return res.status(400).json({
+        success: false,
+        message: "You have already applied for this job",
+      });
+    }
+
+    console.log("✅ No existing application found");
+    console.log("✅ Uploading to Cloudinary (UNSIGNED)...");
+
+    // UNSIGNED upload: uses upload preset, no signature errors
+    const uploadResult = await new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.unsigned_upload_stream(
+        process.env.CLOUDINARY_UPLOAD_PRESET, // e.g. "resumes_unsigned"
+        {
+          resource_type: "raw",
+          folder: "resumes",
+          public_id: `${applicantId}-${Date.now()}-${
+            req.file.originalname.split(".")[0]
+          }`,
+        },
+        (error, result) => {
+          if (error) {
+            console.error("Cloudinary upload error:", error);
+            return reject(error);
+          }
+          resolve(result);
+        }
+      );
+
+      uploadStream.end(req.file.buffer);
+    });
+
+    const resumeUrl = uploadResult.secure_url;
+    const cloudinaryPublicId = uploadResult.public_id;
+
+    console.log("✅ Resume uploaded to:", resumeUrl);
+
+    // Save minimal application with resume URL
+    const newApplication = {
+      jobId: new ObjectId(jobId),
+      applicantId: new ObjectId(applicantId),
+      resumeUrl,
+      cloudinaryPublicId,
+      experience: parseInt(experience) || 0,
+      status: "pending",
+      appliedAt: new Date(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    console.log("✅ Inserting application into database...");
+    const result = await applicationsCollection.insertOne(newApplication);
+    console.log("✅ Application inserted with ID:", result.insertedId);
+
+    return res.status(201).json({
+      success: true,
+      message: "Application submitted successfully",
+      data: {
+        _id: result.insertedId,
+        jobId: newApplication.jobId,
+        resumeUrl: newApplication.resumeUrl,
+        cloudinaryPublicId: newApplication.cloudinaryPublicId,
+        experience: newApplication.experience,
+        status: newApplication.status,
+        appliedAt: newApplication.appliedAt,
+      },
+    });
+  } catch (error) {
+    console.error("=== ERROR IN APPLY FOR JOB ===");
+    console.error(error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error while processing application",
+      error: error.message,
+    });
+  }
+};
+
+// @desc Get applicant's own applications
+// @route GET /applications/my-applications
+// @access Private/Applicant
+export const getMyApplications = async (req, res) => {
+  try {
+    const { status, page = 1, limit = 10 } = req.query;
+    const applicantId = req.user._id;
+
+    const db = getDb();
+    const applicationsCollection = db.collection("applications");
+
+    const matchQuery = { applicantId: new ObjectId(applicantId) };
+    if (status) {
+      matchQuery.status = status;
+    }
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const pipeline = [
+      { $match: matchQuery },
+      {
+        $lookup: {
+          from: "jobs",
+          localField: "jobId",
+          foreignField: "_id",
+          as: "job",
+        },
+      },
+      { $unwind: "$job" },
+      {
+        $project: {
+          "job.createdBy": 0,
+        },
+      },
+      { $sort: { appliedAt: -1 } },
+      { $skip: skip },
+      { $limit: parseInt(limit) },
+    ];
+
+    const applications = await applicationsCollection
+      .aggregate(pipeline)
+      .toArray();
+
+    const total = await applicationsCollection.countDocuments(matchQuery);
+
+    res.status(200).json({
+      success: true,
+      data: applications,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / parseInt(limit)),
+      },
+    });
+  } catch (error) {
+    console.error("Get my applications error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: error.message,
+    });
+  }
+};
+
+// @desc Get all applications (HR/Admin with filters)
+// @route GET /applications
+// @access Private/HR/Admin
+export const getAllApplications = async (req, res) => {
+  try {
+    const { status, jobId, page = 1, limit = 10 } = req.query;
+
+    const db = getDb();
+    const applicationsCollection = db.collection("applications");
+    const jobsCollection = db.collection("jobs");
+
+    const matchQuery = {};
+
+    // HR can only see applications for their jobs
+    if (req.user.role === "hr") {
+      const hrJobs = await jobsCollection
+        .find({ createdBy: new ObjectId(req.user._id) })
+        .project({ _id: 1 })
+        .toArray();
+
+      const jobIds = hrJobs.map((job) => job._id);
+      matchQuery.jobId = { $in: jobIds };
+    }
+
+    if (status) matchQuery.status = status;
+    if (jobId && ObjectId.isValid(jobId)) {
+      matchQuery.jobId = new ObjectId(jobId);
+    }
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const pipeline = [
+      { $match: matchQuery },
+      {
+        $lookup: {
+          from: "jobs",
+          localField: "jobId",
+          foreignField: "_id",
+          as: "job",
+        },
+      },
+      {
+        $lookup: {
+          from: "users",
+          localField: "applicantId",
+          foreignField: "_id",
+          as: "applicant",
+        },
+      },
+      { $unwind: "$job" },
+      { $unwind: "$applicant" },
+      {
+        $project: {
+          "applicant.password": 0,
+        },
+      },
+      { $sort: { appliedAt: -1 } },
+      { $skip: skip },
+      { $limit: parseInt(limit) },
+    ];
+
+    const applications = await applicationsCollection
+      .aggregate(pipeline)
+      .toArray();
+
+    const total = await applicationsCollection.countDocuments(matchQuery);
+
+    res.status(200).json({
+      success: true,
+      data: applications,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / parseInt(limit)),
+      },
+    });
+  } catch (error) {
+    console.error("Get all applications error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: error.message,
+    });
+  }
+};
+
+// @desc Get applications by job
+// @route GET /applications/job/:jobId
+// @access Private/HR/Admin
+export const getApplicationsByJob = async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const { status, page = 1, limit = 10 } = req.query;
+
+    if (!ObjectId.isValid(jobId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid job ID",
+      });
+    }
+
+    const db = getDb();
+    const applicationsCollection = db.collection("applications");
+    const jobsCollection = db.collection("jobs");
+
+    const job = await jobsCollection.findOne({ _id: new ObjectId(jobId) });
+
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        message: "Job not found",
+      });
+    }
+
+    if (
+      req.user.role === "hr" &&
+      job.createdBy.toString() !== req.user._id.toString()
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied. You can only view applications for your jobs.",
+      });
+    }
+
+    const matchQuery = { jobId: new ObjectId(jobId) };
+    if (status) matchQuery.status = status;
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const pipeline = [
+      { $match: matchQuery },
+      {
+        $lookup: {
+          from: "users",
+          localField: "applicantId",
+          foreignField: "_id",
+          as: "applicant",
+        },
+      },
+      { $unwind: "$applicant" },
+      {
+        $project: {
+          "applicant.password": 0,
+        },
+      },
+      { $sort: { appliedAt: -1 } },
+      { $skip: skip },
+      { $limit: parseInt(limit) },
+    ];
+
+    const applications = await applicationsCollection
+      .aggregate(pipeline)
+      .toArray();
+
+    const total = await applicationsCollection.countDocuments(matchQuery);
+
+    res.status(200).json({
+      success: true,
+      data: applications,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / parseInt(limit)),
+      },
+    });
+  } catch (error) {
+    console.error("Get applications by job error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: error.message,
+    });
+  }
+};
+
+// @desc Get single application
+// @route GET /applications/:id
+// @access Private
+export const getApplicationById = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid application ID",
+      });
+    }
+
+    const db = getDb();
+    const applicationsCollection = db.collection("applications");
+
+    const pipeline = [
+      { $match: { _id: new ObjectId(id) } },
+      {
+        $lookup: {
+          from: "jobs",
+          localField: "jobId",
+          foreignField: "_id",
+          as: "job",
+        },
+      },
+      {
+        $lookup: {
+          from: "users",
+          localField: "applicantId",
+          foreignField: "_id",
+          as: "applicant",
+        },
+      },
+      { $unwind: "$job" },
+      { $unwind: "$applicant" },
+      {
+        $project: {
+          "applicant.password": 0,
+        },
+      },
+    ];
+
+    const applications = await applicationsCollection
+      .aggregate(pipeline)
+      .toArray();
+
+    if (!applications || applications.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Application not found",
+      });
+    }
+
+    const application = applications[0];
+
+    const isOwner =
+      application.applicantId.toString() === req.user._id.toString();
+    const isHRForJob =
+      req.user.role === "hr" &&
+      application.job.createdBy.toString() === req.user._id.toString();
+    const isAdmin = req.user.role === "admin";
+
+    if (!isOwner && !isHRForJob && !isAdmin) {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: application,
+    });
+  } catch (error) {
+    console.error("Get application by ID error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: error.message,
+    });
+  }
+};
+
+// @desc Download/Get resume URL
+// @route GET /applications/:id/download
+// @access Private/HR/Admin
+export const downloadResume = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid application ID",
+      });
+    }
+
+    const db = getDb();
+    const applicationsCollection = db.collection("applications");
+
+    const application = await applicationsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!application) {
+      return res.status(404).json({
+        success: false,
+        message: "Application not found",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      resumeUrl: application.resumeUrl,
+      cloudinaryPublicId: application.cloudinaryPublicId,
+      message: "Use this URL to view or download the resume",
+    });
+  } catch (error) {
+    console.error("Download resume error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: error.message,
+    });
+  }
+};
+
+// @desc Update application status
+// @route PATCH /applications/:id/status
+// @access Private/HR/Admin
+export const updateApplicationStatus = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, notes } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid application ID",
+      });
+    }
+
+    const validStatuses = [
+      "pending",
+      "reviewed",
+      "shortlisted",
+      "interview_scheduled",
+      "selected",
+      "rejected",
+    ];
+
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid status. Must be one of: ${validStatuses.join(", ")}`,
+      });
+    }
+
+    const db = getDb();
+    const applicationsCollection = db.collection("applications");
+
+    const updateData = {
+      status,
+      updatedAt: new Date(),
+      reviewedAt: new Date(),
+      reviewedBy: new ObjectId(req.user._id),
+    };
+
+    if (notes) updateData.notes = notes;
+
+    const result = await applicationsCollection.findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      { $set: updateData },
+      { returnDocument: "after" }
+    );
+
+    if (!result) {
+      return res.status(404).json({
+        success: false,
+        message: "Application not found",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Application status updated successfully",
+      data: result,
+    });
+  } catch (error) {
+    console.error("Update application status error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: error.message,
+    });
+  }
+};
+
+// @desc Withdraw application
+// @route DELETE /applications/:id/withdraw
+// @access Private/Applicant
+export const withdrawApplication = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid application ID",
+      });
+    }
+
+    const db = getDb();
+    const applicationsCollection = db.collection("applications");
+
+    const application = await applicationsCollection.findOne({
+      _id: new ObjectId(id),
+      applicantId: new ObjectId(req.user._id),
+    });
+
+    if (!application) {
+      return res.status(404).json({
+        success: false,
+        message: "Application not found",
+      });
+    }
+
+    if (["selected", "rejected"].includes(application.status)) {
+      return res.status(400).json({
+        success: false,
+        message: "Cannot withdraw application at this stage",
+      });
+    }
+
+    // Delete from Cloudinary
+    if (application.cloudinaryPublicId) {
+      await cloudinary.uploader.destroy(application.cloudinaryPublicId, {
+        resource_type: "raw",
+      });
+    }
+
+    await applicationsCollection.deleteOne({ _id: new ObjectId(id) });
+
+    res.status(200).json({
+      success: true,
+      message: "Application withdrawn successfully",
+    });
+  } catch (error) {
+    console.error("Withdraw application error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: error.message,
+    });
+  }
+};
+
+// @desc Delete application (Admin/HR)
+// @route DELETE /applications/:id
+// @access Private/Admin/HR
+export const deleteApplication = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid application ID",
+      });
+    }
+
+    const db = getDb();
+    const applicationsCollection = db.collection("applications");
+
+    const application = await applicationsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!application) {
+      return res.status(404).json({
+        success: false,
+        message: "Application not found",
+      });
+    }
+
+    // Delete from Cloudinary
+    if (application.cloudinaryPublicId) {
+      await cloudinary.uploader.destroy(application.cloudinaryPublicId, {
+        resource_type: "raw",
+      });
+    }
+
+    await applicationsCollection.deleteOne({ _id: new ObjectId(id) });
+
+    res.status(200).json({
+      success: true,
+      message: "Application deleted successfully",
+    });
+  } catch (error) {
+    console.error("Delete application error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: error.message,
+    });
+  }
+};
+
+// @desc Get application statistics
+// @route GET /applications/stats
+// @access Private/HR/Admin
+export const getApplicationStats = async (req, res) => {
+  try {
+    const db = getDb();
+    const applicationsCollection = db.collection("applications");
+    const jobsCollection = db.collection("jobs");
+
+    let matchQuery = {};
+
+    if (req.user.role === "hr") {
+      const hrJobs = await jobsCollection
+        .find({ createdBy: new ObjectId(req.user._id) })
+        .project({ _id: 1 })
+        .toArray();
+
+      const jobIds = hrJobs.map((job) => job._id);
+      matchQuery.jobId = { $in: jobIds };
+    }
+
+    const [
+      totalApplications,
+      pending,
+      reviewed,
+      shortlisted,
+      interviewScheduled,
+      selected,
+      rejected,
+    ] = await Promise.all([
+      applicationsCollection.countDocuments(matchQuery),
+      applicationsCollection.countDocuments({
+        ...matchQuery,
+        status: "pending",
+      }),
+      applicationsCollection.countDocuments({
+        ...matchQuery,
+        status: "reviewed",
+      }),
+      applicationsCollection.countDocuments({
+        ...matchQuery,
+        status: "shortlisted",
+      }),
+      applicationsCollection.countDocuments({
+        ...matchQuery,
+        status: "interview_scheduled",
+      }),
+      applicationsCollection.countDocuments({
+        ...matchQuery,
+        status: "selected",
+      }),
+      applicationsCollection.countDocuments({
+        ...matchQuery,
+        status: "rejected",
+      }),
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        totalApplications,
+        statusBreakdown: {
+          pending,
+          reviewed,
+          shortlisted,
+          interviewScheduled,
+          selected,
+          rejected,
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Get application stats error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: error.message,
+    });
+  }
+};
